@@ -1,0 +1,155 @@
+name: Build Android 15 GKI Kernel (KSU + ZeroMount + Droidspaces)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Kernel Manifest Branch'
+        required: true
+        default: 'common-android15-6.6'
+        type: string
+
+jobs:
+  Details:
+    name: Sync, Patch, and Build Kernel
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 curl ccache build-essential rsync bc zip
+          
+          # Install 'repo' tool
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "~/bin" >> $GITHUB_PATH
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "hworr93"
+          git config --global user.email "hworr93@gmail.com"
+
+      - name: Sync Kernel Source
+        run: |
+          mkdir kernel_workspace
+          cd kernel_workspace
+          repo init -u https://android.googlesource.com/kernel/manifest -b ${{ inputs.branch }} --depth=1
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --optimized-fetch
+
+      - name: Fetch Modding Projects
+        working-directory: ./kernel_workspace
+        run: |
+          # Fetch the requested repositories into the workspace
+          git clone https://github.com/Enginex0/zeromount.git
+          git clone https://github.com/ravindu644/Droidspaces-OSS.git
+          git clone https://github.com/hworr93/LKM_Tools.git
+          
+          # Wild_KSU is usually integrated via its standalone setup script
+          cd common
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/main/setup.sh" | bash -
+
+      - name: Apply Kernel Patches
+        working-directory: ./kernel_workspace/common
+        run: |
+          # 1. Integrate ZeroMount (Check zeromount repo for exact patch name for 6.6)
+          patch -p1 < ../zeromount/kernel_patches/6.6.patch || echo "Please verify ZeroMount patch path."
+          
+          # 2. Integrate Droidspaces-OSS (Check Droidspaces repo for exact patch name for 6.6)
+          patch -p1 < ../Droidspaces-OSS/Kernel-Patches/6.6/namespaces.patch || echo "Please verify Droidspaces patch path."
+
+      - name: Apply Kernel Configs (avf-android style)
+        working-directory: ./kernel_workspace/common
+        run: |
+          # Instead of applying to .config (which Bazel overwrites), we apply to the GKI defconfig directly
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          
+          ./scripts/config --file $DEFCONFIG \
+            -e CONFIG_KPROBES \
+            -e CONFIG_KPROBE_EVENTS \
+            -e CONFIG_OVERLAY_FS \
+            -e CONFIG_NAMESPACES \
+            -e CONFIG_USER_NS \
+            -e CONFIG_PID_NS \
+            -e CONFIG_IPC_NS \
+            -e CONFIG_CGROUPS \
+            -e CONFIG_CGROUP_DEVICE \
+            -e CONFIG_BINFMT_MISC \
+            -e CONFIG_VETH
+            
+          # Optional: add ZeroMount/KSU specific configs if they have custom flags (e.g. CONFIG_KSU)
+          ./scripts/config --file $DEFCONFIG -e CONFIG_KSU -e CONFIG_ZERO_MOUNT
+          
+          make ARCH=arm64 savedefconfig
+
+      - name: Build GKI Kernel & Modules
+        working-directory: ./kernel_workspace
+        run: |
+          # GKI 15 uses Bazel to compile. This will generate the boot.img and the module staging dir
+          tools/bazel run //common:kernel_aarch64_dist -- --dist_dir=out/dist
+
+      - name: Prepare Vendor Modules using LKM_Tools
+        working-directory: ./kernel_workspace
+        run: |
+          chmod +x LKM_Tools/*.sh
+          
+          # Define standard GKI build paths from the Bazel output
+          STAGING_DIR="$(pwd)/out/dist/modules/lib/modules"
+          SYSTEM_MAP="$(pwd)/out/dist/System.map"
+          LLVM_STRIP="$(pwd)/prebuilts/clang/host/linux-x86/clang-r536225/bin/llvm-strip" # Adjust clang version for Android 15 6.6 if needed
+          
+          # Define outputs
+          mkdir -p out/vendor_boot_modules out/vendor_dlkm_modules
+          
+          # IMPORTANT: LKM_Tools requires your STOCK modules.dep / modules.load files to know how to sort the newly built modules.
+          # You MUST upload these files to your GitHub repository for LKM_Tools to reference them.
+          # Assuming you placed them in a folder called 'stock_files' in your github repo:
+          
+          STOCK_BOOT_DEP="${GITHUB_WORKSPACE}/stock_files/vendor_boot_modules.dep"
+          STOCK_BOOT_LOAD="${GITHUB_WORKSPACE}/stock_files/vendor_boot_modules.load"
+          STOCK_DLKM_LOAD="${GITHUB_WORKSPACE}/stock_files/vendor_dlkm_modules.load"
+          
+          echo "=> 1. Processing vendor_boot modules..."
+          # ./02.prepare_vendor_boot_modules.sh <master_list> <staging_dir> <stock_modules_load> <system_map> <output_dir> <llvm_strip>
+          ./LKM_Tools/02.prepare_vendor_boot_modules.sh \
+            "$STOCK_BOOT_DEP" \
+            "$STAGING_DIR" \
+            "$STOCK_BOOT_LOAD" \
+            "$SYSTEM_MAP" \
+            "out/vendor_boot_modules" \
+            "$LLVM_STRIP"
+            
+          echo "=> 2. Processing vendor_dlkm modules..."
+          # ./03.prepare_vendor_dlkm.sh <staging_dir> <vendor_boot_list> <vendor_dlkm_list> <system_map> <output_dir> <llvm_strip>
+          ./LKM_Tools/03.prepare_vendor_dlkm.sh \
+            "$STAGING_DIR" \
+            "out/vendor_boot_modules/modules_list.txt" \
+            "$STOCK_DLKM_LOAD" \
+            "$SYSTEM_MAP" \
+            "out/vendor_dlkm_modules" \
+            "$LLVM_STRIP"
+
+      - name: Package & Upload Kernel Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android15-GKI-Modded
+          path: |
+            kernel_workspace/out/dist/Image
+            kernel_workspace/out/dist/boot.img
+            kernel_workspace/out/vendor_boot_modules/
+            kernel_workspace/out/vendor_dlkm_modules/
+          retention-days: 7
+          
